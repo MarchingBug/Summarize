@@ -16,12 +16,13 @@ import pandas as pd
 import os
 import json
 from pprint import pprint
+import io
 
 from openai import AzureOpenAI
 import tiktoken
 from typing import Callable, List, Dict, Optional, Generator, Tuple, Union
 
-
+from azure.identity import DefaultAzureCredential
 
 
 #from azure.core.credentials import AzureKeyCredential
@@ -56,6 +57,8 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_EMBEDDING_MODEL = os.environ["OPENAI_EMBEDDING_MODEL"]
 OPENAI_API_MODEL =  os.environ["OPENAI_API_MODEL"]
 OPENAI_MODEL_MAX_TOKENS = os.environ["OPENAI_MODEL_MAX_TOKENS"]
+USE_MANAGED_IDENTITY = os.environ["USE_MANAGED_IDENTITY"]
+USER_ASSIGNED_IDENTITY = os.environ["USER_ASSIGNED_IDENTITY"]
 
 accumulated_summaries = []
 document_chunks = []  
@@ -210,61 +213,103 @@ def format_final_response(final_summary):
 
 def summarize_document(chunks,summarize_recursively=False,system_message_content="Rewrite this text in summarized form.",additional_instructions=None,tokens_per_chunk=OPENAI_MODEL_MAX_TOKENS):
     
-    TOKEN_ESTIMATOR = TokenEstimator()
+    try:
+        TOKEN_ESTIMATOR = TokenEstimator()
+        
+
+        accumulated_summaries = []
+        make_the_call = False
+        user_message_content = ""
+
+        document_tokens_per_chunk = int(tokens_per_chunk)
+
+        if additional_instructions is not None:
+            system_message_content += f"\n\n{additional_instructions}"  
+
+        for index,chunk in chunks.iterrows():
+            #print(f"Summarizing chunk {chunk['content']}...")
+            if summarize_recursively and accumulated_summaries:
+                # Creating a structured prompt for recursive summarization
+                ##########################################
+                accumulated_summaries_string = '\n\n'.join(accumulated_summaries)
+                content_chunk_size=TOKEN_ESTIMATOR.estimate_tokens(f"Previous summaries:\n\n{accumulated_summaries_string}\n\nText to summarize next:\n\n{chunk['content']}")
+                if content_chunk_size < document_tokens_per_chunk:
+                    user_message_content = f"Previous summaries:\n\n{accumulated_summaries_string}\n\nText to summarize next:\n\n{chunk['content']}"
+                else:
+                    make_the_call = True
+                ###########################################
+            else:
+                # Directly passing the chunk for summarization without recursive context                      
+                content_chunk_size=TOKEN_ESTIMATOR.estimate_tokens(user_message_content + chunk['content'])
+                if content_chunk_size < document_tokens_per_chunk:
+                    user_message_content = user_message_content + chunk['content']
+                else:
+                    make_the_call = True
+
+            if index == len(chunks) - 1:          
+               make_the_call = True
+
+            if make_the_call:
+                # Constructing messages based on whether recursive summarization is applied
+                messages = [
+                    {"role": "system", "content": system_message_content},
+                    {"role": "user", "content": user_message_content}
+                ]
+
+                # Assuming this function gets the completion and works as expected
+                response = get_chat_completion(system_message_content, user_message_content)
+                accumulated_summaries.append(response)
+                if not summarize_recursively:
+                    user_message_content = ""
+
+                make_the_call = False
+
+        # Compile final summary from partial summaries
+        final_summary = '\n\n'.join(accumulated_summaries)    
+        final_summary = format_final_response(final_summary)
+
+        return final_summary
+    
+    except Exception as e: 
+        errors = "message: Failure during summarize_document" + str(e)
+        return func.HttpResponse(
+             errors, status_code=500
+        ) 
     
 
-    accumulated_summaries = []
-    make_the_call = False
-    user_message_content = ""
+def read_parquet_from_blob(storage_account_name, container_name, blob_path):
+    """Reads a Parquet file from Azure Blob Storage using a managed identity."""
 
-    document_tokens_per_chunk = int(tokens_per_chunk)
+    # Create a credential object using the managed identity
+    client_id = USER_ASSIGNED_IDENTITY
+    credential = DefaultAzureCredential(managed_identity_client_id=client_id)
+   
+    # Create a BlobServiceClient using the credential
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{storage_account_name}.blob.core.windows.net",
+        credential=credential
+    )
 
-    if additional_instructions is not None:
-        system_message_content += f"\n\n{additional_instructions}"  
+    # Get a reference to the blob
+    blob_client = blob_service_client.get_blob_client(container_name, blob_path)
 
-    for index,chunk in chunks.iterrows():
-        #print(f"Summarizing chunk {chunk['content']}...")
-        if summarize_recursively and accumulated_summaries:
-            # Creating a structured prompt for recursive summarization
-            ##########################################
-            accumulated_summaries_string = '\n\n'.join(accumulated_summaries)
-            content_chunk_size=TOKEN_ESTIMATOR.estimate_tokens(f"Previous summaries:\n\n{accumulated_summaries_string}\n\nText to summarize next:\n\n{chunk['content']}")
-            if content_chunk_size < document_tokens_per_chunk:
-                user_message_content = f"Previous summaries:\n\n{accumulated_summaries_string}\n\nText to summarize next:\n\n{chunk['content']}"
-            else:
-                make_the_call = True
-            ###########################################
-        else:
-            # Directly passing the chunk for summarization without recursive context                      
-            content_chunk_size=TOKEN_ESTIMATOR.estimate_tokens(user_message_content + chunk['content'])
-            if content_chunk_size < document_tokens_per_chunk:
-                user_message_content = user_message_content + chunk['content']
-            else:
-                make_the_call = True
+    # Download the blob as bytes
+    blob_data = blob_client.download_blob().readall()
 
-        if index == len(chunks) - 1:          
-          make_the_call = True
+    # Read the Parquet data into a Pandas DataFrame
+    df = pd.read_parquet(io.BytesIO(blob_data))
 
-        if make_the_call:
-            # Constructing messages based on whether recursive summarization is applied
-            messages = [
-                {"role": "system", "content": system_message_content},
-                {"role": "user", "content": user_message_content}
-            ]
+    return df
 
-            # Assuming this function gets the completion and works as expected
-            response = get_chat_completion(system_message_content, user_message_content)
-            accumulated_summaries.append(response)
-            if not summarize_recursively:
-                user_message_content = ""
+def read_file_contents(file_name):
+    if USE_MANAGED_IDENTITY == "0":       
+       file_url = generate_file_sas(file_name,SUMMARY_PARQUET_CONTAINER)
+       logging.info("Generated SAS token " + file_url)               
+       return pd.read_parquet(file_url)
+    else:
+       logging.info("reading file from storage account " + file_name)       
+       return read_parquet_from_blob(AZURE_ACC_NAME,SUMMARY_PARQUET_CONTAINER,file_name)
 
-            make_the_call = False
-
-    # Compile final summary from partial summaries
-    final_summary = '\n\n'.join(accumulated_summaries)    
-    final_summary = format_final_response(final_summary)
-
-    return final_summary
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
@@ -286,14 +331,13 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
                 pass
             else:
                 file_name = req_body.get('file_name')
-                file_url = req_body.get('file_url')
+                #file_url = req_body.get('file_url')
                 system_message_content = req_body.get('system_message')
                 additional_instructions = req_body.get('additional_instructions')
                 summarize_recursively = req_body.get('summarize_recursively') 
                 tokens_per_chunk = req_body.get('tokens_per_chunk')               
 
-        if not file_url or file_url == "":
-            file_url = generate_file_sas(file_name,SUMMARY_PARQUET_CONTAINER)
+        
 
         if not system_message_content or system_message_content == "":
             system_message_content = "Rewrite this text in summarized form."
@@ -307,8 +351,7 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         if not tokens_per_chunk or tokens_per_chunk == "":
             tokens_per_chunk = OPENAI_MODEL_MAX_TOKENS
 
-        logging.info("Generated SAS token " + file_url)       
-        df = pd.read_parquet(file_url)
+        df = read_file_contents(file_name)
         logging.info("Read parquet file")   
         final_summary = summarize_document(df,summarize_recursively=summarize_recursively,system_message_content=system_message_content,additional_instructions=additional_instructions,tokens_per_chunk=tokens_per_chunk)
         logging.info("Summarized document " + final_summary)        

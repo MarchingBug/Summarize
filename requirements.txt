@@ -4,6 +4,7 @@
 
 azure-functions
 requests
+azure-identity
 azure-storage-blob
 azure-core
 azure-ai-formrecognizer

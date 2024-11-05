@@ -23,6 +23,8 @@ from datetime import datetime, timedelta,timezone
 import pandas as pd
 from io import BytesIO
 from typing import Callable, List, Dict, Optional, Generator, Tuple, Union
+from azure.identity import DefaultAzureCredential
+import io
 
 AFR_ENDPOINT = os.environ["AFR_ENDPOINT"]
 AFR_API_KEY = os.environ["AFR_API_KEY"]
@@ -48,6 +50,8 @@ SQL_USERNAME = os.environ["SQL_USERNAME"]
 
 TEXT_ANALYTICS_KEY = os.environ["TEXT_ANALYTICS_KEY"]
 TEXT_ANALYTICS_ENDPOINT = os.environ["TEXT_ANALYTICS_ENDPOINT"]
+USE_MANAGED_IDENTITY = os.environ["USE_MANAGED_IDENTITY"]
+USER_ASSIGNED_IDENTITY = os.environ["USER_ASSIGNED_IDENTITY"]
 
 SENTENCE_ENDINGS = [".", "!", "?"]
 WORDS_BREAKS = list(reversed([",", ";", ":", " ", "(", ")", "[", "]", "{", "}", "\t", "\n"]))
@@ -115,8 +119,15 @@ def save_array_to_azure(array, file_name, container_name):
         df.to_parquet(parquet_file, engine='pyarrow')   
         parquet_file.seek(0)
 
-        blob_service_client = BlobServiceClient.from_connection_string(storage_account_connection_string)
-        blob_client = blob_service_client.get_blob_client(container=container_name, blob=final_file_name)
+        if USE_MANAGED_IDENTITY == "0":
+            blob_service_client = BlobServiceClient.from_connection_string(storage_account_connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=final_file_name)
+        else:
+            client_id = USER_ASSIGNED_IDENTITY
+            credential = DefaultAzureCredential(managed_identity_client_id=client_id)
+            blob_service_client = BlobServiceClient(account_url=f"https://{AZURE_ACC_NAME}.blob.core.windows.net", credential=credential)
+            blob_client = blob_service_client.get_blob_client(container=container_name, blob=final_file_name)
+        
         
         blob_client.upload_blob(
              data=parquet_file,overwrite=True
@@ -141,11 +152,39 @@ class TokenEstimator(object):
             self.GPT2_TOKENIZER.encode(tokens, allowed_special="all")[:numofTokens]
         )
         return newTokens 
+    
+def read_parquet_from_blob(storage_account_name, container_name, blob_path):
+    """Reads a Parquet file from Azure Blob Storage using a managed identity."""
 
-def process_file(file_URL,filename,chunck_size=1024):
+    # Create a credential object using the managed identity
+    client_id = USER_ASSIGNED_IDENTITY
+    credential = DefaultAzureCredential(managed_identity_client_id=client_id)
+   
+    # Create a BlobServiceClient using the credential
+    blob_service_client = BlobServiceClient(
+        account_url=f"https://{storage_account_name}.blob.core.windows.net",
+        credential=credential
+    )
+
+    # Get a reference to the blob
+    blob_client = blob_service_client.get_blob_client(container_name, blob_path)
+
+    # Download the blob as bytes
+    blob_data = blob_client.download_blob().readall()
+
+    # Read the Parquet data into a Pandas DataFrame
+    df = pd.read_parquet(io.BytesIO(blob_data))
+
+    return df
+
+
+
+def get_afr_result(file_name,chunck_size=1024):
+    
     try:      
-        logging.info(f"Processing {filename}...")
-        document_chunks = []  
+        logging.info(f"Processing {file_name}...")         
+
+
         endpoint = AFR_ENDPOINT
         key = AFR_API_KEY
 
@@ -158,15 +197,48 @@ def process_file(file_URL,filename,chunck_size=1024):
             "prebuilt-layout", AnalyzeDocumentRequest(url_source=file_URL)
         )    
         
-        result = poller.result()     
-        return process_afr_result(result, filename, file_URL)   
+        result = ""
+
+        if USE_MANAGED_IDENTITY == "0":
+            file_URL = generate_file_sas(file_name,SUMMARY_CONTAINER)
+            logging.info(file_URL)
+            if(file_URL != ""):
+               print(f"Analyzing form from URL {file_URL}...")
+               poller = document_intelligence_client.begin_analyze_document(
+                       "prebuilt-layout", AnalyzeDocumentRequest(url_source=file_URL)
+                        ) 
+               result = poller.result()       
+        else:
+             logging.info("reading file from storage account " + file_name)       
+             file_content = read_parquet_from_blob(AZURE_ACC_NAME,SUMMARY_PARQUET_CONTAINER,file_name)
+
+             poller = document_intelligence_client.begin_read_in_stream(file_content)
+            
+             result = poller.result() 
+       
+        return result   
+    except Exception as e:
+        errors = "message: Fget_arf_result" + str(e)    
+
+
+def process_file(filename,chunck_size=1024):
+    try:      
+        logging.info(f"Processing {filename}...")
+        document_chunks = []         
+               
+        result =  get_afr_result(filename,chunck_size=1024)    
+        return process_afr_result(result, filename)   
+    
     except Exception as e:
         errors = "message: Failure during process_file" + str(e)
 
 
-def process_afr_result(result, filename,URL, content_chunk_overlap=100):   
+def process_afr_result(result, filename, content_chunk_overlap=100):   
    
    try:
+        
+        URL = generate_file_sas(filename,SUMMARY_CONTAINER)
+
         print(f"Processing {filename } with {len(result.pages)} pages into database...this might take a few minutes depending on number of pages...")
         chunk_id = 1 
         TOKEN_ESTIMATOR = TokenEstimator()
@@ -238,10 +310,9 @@ def main(req: func.HttpRequest,context: func.Context) -> func.HttpResponse:
 
         final_file_name = file_name
         #URL = "https://useducsapocdatalake.blob.core.windows.net/document-summarization/NEJMoa2404881.pdf?sp=racw&st=2024-07-01T19:06:38Z&se=2025-06-02T03:06:38Z&sv=2022-11-02&sr=b&sig=PGbQWGOTIXET6ViOf9roTxFRWq5wItvCZxOURKARGGw%3D"
-        #file_name = "NEJMoa2404881.pdf"
-        URL = generate_file_sas(file_name,SUMMARY_CONTAINER)
-        logging.info(URL)
-        document_chunks = process_file(URL,file_name)
+        file_name = "NEJMoa2404881.pdf"
+      
+        document_chunks = process_file(file_name)
         #if this is a string, then it is an error
         if isinstance(document_chunks, str) or document_chunks is None:
              return func.HttpResponse(
