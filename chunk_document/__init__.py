@@ -3,6 +3,7 @@ import logging
 import azure.functions as func
 import os
 import json
+import requests
 
 from azure.core.credentials import AzureKeyCredential
 import azure.storage.blob
@@ -42,6 +43,13 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 OPENAI_EMBEDDING_MODEL = os.environ["OPENAI_EMBEDDING_MODEL"]
 OPENAI_API_MODEL =  os.environ["OPENAI_API_MODEL"]
 
+#if you are saving to Search AI 
+SEARCH_ENDPOINT = os.environ["AZSEARCH_EP"]
+SEARCH_API_KEY = os.environ["AZSEARCH_KEY"]
+SEARCH_INDEX = os.environ["INDEX_NAME"]
+api_version = '?api-version=2021-04-30-Preview'
+headers = {'Content-Type': 'application/json',
+        'api-key': SEARCH_API_KEY }
 
 SQL_PASSWORD = os.environ["SQL_SECRET"]
 SQL_SERVER = os.environ["SQL_SERVER"]
@@ -65,6 +73,146 @@ client = AzureOpenAI(
   api_key= OPENAI_API_KEY , 
   api_version="2024-02-15-preview"
 )
+
+#if saving to Azure Search AI
+index_name = SEARCH_INDEX
+
+index_schema = {
+  "name": index_name,
+  "fields": [
+    {
+      "name": "id",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": True,
+      "retrievable": True,
+      "searchable": False,
+      "sortable": False,
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "text",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": False,
+      "retrievable": True,
+      "searchable": True,
+      "sortable": False,
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "fileName",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": False,
+      "retrievable": True,
+      "searchable": False,
+      "sortable": False,
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "pageNumber",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": False,
+      "retrievable": True,
+      "searchable": False,
+      "sortable": False,
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "summary",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": False,
+      "retrievable": True,
+      "searchable": True,
+      "sortable": False,
+      "analyzer": "standard.lucene",
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "title",
+      "type": "Edm.String",
+      "facetable": False,
+      "filterable": False,
+      "key": False,
+      "retrievable": True,
+      "searchable": True,
+      "sortable": False,
+      "analyzer": "standard.lucene",
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    },
+    {
+      "name": "embedding",
+      "type": "Collection(Edm.Double)",
+      "facetable": False,
+      "filterable": False,
+      "retrievable": True,
+      "searchable": False,
+      "analyzer": None,
+      "indexAnalyzer": None,
+      "searchAnalyzer": None,
+      "synonymMaps": [],
+      "fields": []
+    }
+    
+  ],
+  "suggesters": [],
+  "scoringProfiles": [],
+  "defaultScoringProfile": "",
+  "corsOptions": None,
+  "analyzers": [],
+  "semantic": {
+     "configurations": [
+       {
+         "name": "semantic-config",
+         "prioritizedFields": {
+           "titleField": {
+                 "fieldName": "title"
+               },
+           "prioritizedContentFields": [
+             {
+               "fieldName": "text"
+             }            
+           ],
+           "prioritizedKeywordsFields": [
+             {
+               "fieldName": "text"
+             }             
+           ]
+         }
+       }
+     ]
+  },
+  "charFilters": [],
+  "tokenFilters": [],
+  "tokenizers": [],
+  "@odata.etag": "\"0x8D8B90E3409E48F\""
+}
 
 class DocumentChunk:
     def __init__(self, filename, chunk_id, document_url, content, page_number, line_number):        
@@ -101,6 +249,24 @@ def generate_file_sas(file_name,container_name):
     filewithsas=  "https://"+AZURE_ACC_NAME+".blob.core.windows.net/"+container_name+"/"+file_name+"?"+sas_token  
     return filewithsas
 
+def save_array_to_search_ai(array, file_name):
+    try:
+        #Azure Search AI Add Documents
+      docs = []
+      for item in array:
+         docs = []
+         search_doc = {
+                    "id":  f"page-number-{item.page_number}-line-number-{item.line_number}",
+                    "text": item.content,
+                    "fileName": item.filename,
+                    "pageNumber": str(item.page_number)
+              }
+         docs.append(search_doc)
+         add_document_to_index(item.page_number, docs)
+    except Exception as e:
+        errors = [ { "message": "Failure during save_array_to_search_ai e: " + str(e)}]
+        print(errors)
+        return None
 
 def save_array_to_azure(array, file_name, container_name):
     # Convert the array to a pandas DataFrame    
@@ -291,7 +457,35 @@ def process_afr_result(result, filename, content_chunk_overlap=100):
         errors = "message: Failure during process_afr_result" + str(e)
         return errors
 
+def delete_search_index():
+    try:
+        #Azure Search AI Delete Index
+        url = SEARCH_ENDPOINT + "indexes/" + index_name + api_version 
+        response  = requests.delete(url, headers=headers)
+        print("Index deleted")
+    except Exception as e:
+        print(e)
 
+def create_search_index():
+    try:
+        # Azure Search AI Create Index
+        url = SEARCH_ENDPOINT + "indexes" + api_version
+        response  = requests.post(url, headers=headers, json=index_schema)
+        index = response.json()
+        print("Index created")
+    except Exception as e:
+        print(e)
+
+
+
+def add_document_to_index(page_idx, documents):
+    try:
+        #Azure Search AI Add Documents
+        url = SEARCH_ENDPOINT + "indexes/" + index_name + "/docs/index" + api_version
+        response  = requests.post(url, headers=headers, json=documents)
+        print(f"page_idx is {page_idx} - {len(documents['value'])} Documents added")
+    except Exception as e:
+        print(e)
 
 def main(req: func.HttpRequest,context: func.Context) -> func.HttpResponse:
     logging.info('Python HTTP trigger function processed a request.')
@@ -318,6 +512,11 @@ def main(req: func.HttpRequest,context: func.Context) -> func.HttpResponse:
              return func.HttpResponse(
              document_chunks, status_code=500
         )
+
+        #If saving to Azure AI Search
+        #delete_search_index()
+        #create_search_index()
+        #save_array_to_search_ai(document_chunks, file_name)
 
         final_file_name = save_array_to_azure(document_chunks, file_name, SUMMARY_PARQUET_CONTAINER)
         
