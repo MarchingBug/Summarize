@@ -44,12 +44,12 @@ OPENAI_EMBEDDING_MODEL = os.environ["OPENAI_EMBEDDING_MODEL"]
 OPENAI_API_MODEL =  os.environ["OPENAI_API_MODEL"]
 
 #if you are saving to Search AI uncomment this 
-#SEARCH_ENDPOINT = os.environ["AZSEARCH_EP"]
-#SEARCH_API_KEY = os.environ["AZSEARCH_KEY"]
-#SEARCH_INDEX = os.environ["INDEX_NAME"]
-#api_version = '?api-version=2021-04-30-Preview'
-#headers = {'Content-Type': 'application/json',
-#        'api-key': SEARCH_API_KEY }
+SEARCH_ENDPOINT = os.environ["AZSEARCH_EP"]
+SEARCH_API_KEY = os.environ["AZSEARCH_KEY"]
+SEARCH_INDEX = os.environ["INDEX_NAME"]
+api_version = '?api-version=2021-04-30-Preview'
+headers = {'Content-Type': 'application/json',
+        'api-key': SEARCH_API_KEY }
 
 SQL_PASSWORD = os.environ["SQL_SECRET"]
 SQL_SERVER = os.environ["SQL_SERVER"]
